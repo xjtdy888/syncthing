@@ -18,13 +18,17 @@ init
 
 clean
 fetchExtra
-test
 
 # Solaris always uses cgo, as opposed to our regular cross builds
 export CGO_ENABLED=1
 
-# Specifically set "syncthing" target as discosrv currently doesn't build
-go run build.go tar syncthing
+# Test the stuff we are going to build only, as discosrv etc fails
+echo Testing
+go test -v -race ./lib/... ./cmd/syncthing
+echo
 
+# Specifically set "syncthing" target as discosrv currently doesn't build
+echo Building
+go run build.go tar syncthing
 mv *.tar.gz "$WORKSPACE"
 echo
