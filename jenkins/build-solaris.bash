@@ -18,7 +18,6 @@ init
 
 clean
 fetchExtra
-build
 test
 
 # Solaris always uses cgo, as opposed to our regular cross builds
