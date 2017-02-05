@@ -22,6 +22,9 @@ fetchExtra
 # Solaris always uses cgo, as opposed to our regular cross builds
 export CGO_ENABLED=1
 
+# Quick build, generate assets
+go run build.go build syncthing
+
 # Test the stuff we are going to build only, as discosrv etc fails.
 # -race is not supported on Solaris.
 echo Testing
