@@ -21,6 +21,9 @@ fetchExtra
 build
 test
 
+# Solaris always uses cgo, as opposed to our regular cross builds
+export CGO_ENABLED=1
+
 # Specifically set "syncthing" target as discosrv currently doesn't build
 go run build.go tar syncthing
 
