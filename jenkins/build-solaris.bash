@@ -22,9 +22,10 @@ fetchExtra
 # Solaris always uses cgo, as opposed to our regular cross builds
 export CGO_ENABLED=1
 
-# Test the stuff we are going to build only, as discosrv etc fails
+# Test the stuff we are going to build only, as discosrv etc fails.
+# -race is not supported on Solaris.
 echo Testing
-go test -v -race ./lib/... ./cmd/syncthing
+go test -v ./lib/... ./cmd/syncthing
 echo
 
 # Specifically set "syncthing" target as discosrv currently doesn't build
