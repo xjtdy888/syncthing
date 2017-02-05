@@ -25,7 +25,7 @@ export CGO_ENABLED=1
 # Test the stuff we are going to build only, as discosrv etc fails.
 # -race is not supported on Solaris.
 echo Testing
-go test -v ./lib/... ./cmd/syncthing
+go test ./lib/... ./cmd/syncthing
 echo
 
 # Specifically set "syncthing" target as discosrv currently doesn't build
