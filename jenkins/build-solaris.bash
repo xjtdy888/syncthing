@@ -21,6 +21,8 @@ fetchExtra
 build
 test
 
-go run build.go tar
+# Specifically set "syncthing" target as discosrv currently doesn't build
+go run build.go tar syncthing
+
 mv *.tar.gz "$WORKSPACE"
 echo
