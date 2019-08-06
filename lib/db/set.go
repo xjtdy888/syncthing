@@ -20,14 +20,14 @@ import (
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sync"
+	"github.com/syndtr/goleveldb/leveldb/util"
 )
 
 type FileSet struct {
-	folder   string
-	fs       fs.Filesystem
-	db       *Instance
-	blockmap *BlockMap
-	meta     *metadataTracker
+	folder string
+	fs     fs.Filesystem
+	db     *instance
+	meta   *metadataTracker
 
 	updateMutex sync.Mutex // protects database updates and the corresponding metadata changes
 }
@@ -37,10 +37,16 @@ type FileSet struct {
 type FileIntf interface {
 	FileSize() int64
 	FileName() string
+	FileLocalFlags() uint32
 	IsDeleted() bool
 	IsInvalid() bool
+	IsIgnored() bool
+	IsUnsupported() bool
+	MustRescan() bool
+	IsReceiveOnlyChanged() bool
 	IsDirectory() bool
 	IsSymlink() bool
+	ShouldConflict() bool
 	HasPermissionBits() bool
 	SequenceNo() int64
 	BlockSize() int
@@ -60,12 +66,13 @@ func init() {
 	}
 }
 
-func NewFileSet(folder string, fs fs.Filesystem, db *Instance) *FileSet {
+func NewFileSet(folder string, fs fs.Filesystem, ll *Lowlevel) *FileSet {
+	db := newInstance(ll)
+
 	var s = FileSet{
 		folder:      folder,
 		fs:          fs,
 		db:          db,
-		blockmap:    NewBlockMap(db, db.folderIdx.ID([]byte(folder))),
 		meta:        newMetadataTracker(),
 		updateMutex: sync.NewMutex(),
 	}
@@ -106,7 +113,6 @@ func (s *FileSet) Drop(device protocol.DeviceID) {
 	s.db.dropDeviceFolder(device[:], []byte(s.folder), s.meta)
 
 	if device == protocol.LocalDeviceID {
-		s.blockmap.Drop()
 		s.meta.resetCounts(device)
 		// We deliberately do not reset the sequence number here. Dropping
 		// all files for the local device ID only happens in testing - which
@@ -135,38 +141,15 @@ func (s *FileSet) Update(device protocol.DeviceID, fs []protocol.FileInfo) {
 	s.updateMutex.Lock()
 	defer s.updateMutex.Unlock()
 
+	defer s.meta.toDB(s.db, []byte(s.folder))
+
 	if device == protocol.LocalDeviceID {
-		discards := make([]protocol.FileInfo, 0, len(fs))
-		updates := make([]protocol.FileInfo, 0, len(fs))
-		// db.UpdateFiles will sort unchanged files out -> save one db lookup
-		// filter slice according to https://github.com/golang/go/wiki/SliceTricks#filtering-without-allocating
-		oldFs := fs
-		fs = fs[:0]
-		var dk []byte
-		folder := []byte(s.folder)
-		for _, nf := range oldFs {
-			dk = s.db.deviceKeyInto(dk, folder, device[:], []byte(osutil.NormalizedFilename(nf.Name)))
-			ef, ok := s.db.getFile(dk)
-			if ok && ef.Version.Equal(nf.Version) && ef.Invalid == nf.Invalid {
-				continue
-			}
-
-			nf.Sequence = s.meta.nextSeq(protocol.LocalDeviceID)
-			fs = append(fs, nf)
-
-			if ok {
-				discards = append(discards, ef)
-			}
-			updates = append(updates, nf)
-		}
-		s.blockmap.Discard(discards)
-		s.blockmap.Update(updates)
-		s.db.removeSequences(folder, discards)
-		s.db.addSequences(folder, updates)
+		// For the local device we have a bunch of metadata to track.
+		s.db.updateLocalFiles([]byte(s.folder), fs, s.meta)
+		return
 	}
-
-	s.db.updateFiles([]byte(s.folder), device[:], fs, s.meta)
-	s.meta.toDB(s.db, []byte(s.folder))
+	// Easy case, just update the files and we're done.
+	s.db.updateRemoteFiles([]byte(s.folder), device[:], fs, s.meta)
 }
 
 func (s *FileSet) WithNeed(device protocol.DeviceID, fn Iterator) {
@@ -218,13 +201,13 @@ func (s *FileSet) WithPrefixedGlobalTruncated(prefix string, fn Iterator) {
 }
 
 func (s *FileSet) Get(device protocol.DeviceID, file string) (protocol.FileInfo, bool) {
-	f, ok := s.db.getFile(s.db.deviceKey([]byte(s.folder), device[:], []byte(osutil.NormalizedFilename(file))))
+	f, ok := s.db.getFileDirty([]byte(s.folder), device[:], []byte(osutil.NormalizedFilename(file)))
 	f.Name = osutil.NativeFilename(f.Name)
 	return f, ok
 }
 
 func (s *FileSet) GetGlobal(file string) (protocol.FileInfo, bool) {
-	fi, ok := s.db.getGlobal([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), false)
+	fi, ok := s.db.getGlobalDirty([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), false)
 	if !ok {
 		return protocol.FileInfo{}, false
 	}
@@ -234,7 +217,7 @@ func (s *FileSet) GetGlobal(file string) (protocol.FileInfo, bool) {
 }
 
 func (s *FileSet) GetGlobalTruncated(file string) (FileInfoTruncated, bool) {
-	fi, ok := s.db.getGlobal([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), true)
+	fi, ok := s.db.getGlobalDirty([]byte(s.folder), []byte(osutil.NormalizedFilename(file)), true)
 	if !ok {
 		return FileInfoTruncated{}, false
 	}
@@ -248,15 +231,23 @@ func (s *FileSet) Availability(file string) []protocol.DeviceID {
 }
 
 func (s *FileSet) Sequence(device protocol.DeviceID) int64 {
-	return s.meta.Counts(device).Sequence
+	return s.meta.Sequence(device)
 }
 
 func (s *FileSet) LocalSize() Counts {
-	return s.meta.Counts(protocol.LocalDeviceID)
+	local := s.meta.Counts(protocol.LocalDeviceID, 0)
+	recvOnlyChanged := s.meta.Counts(protocol.LocalDeviceID, protocol.FlagLocalReceiveOnly)
+	return local.Add(recvOnlyChanged)
+}
+
+func (s *FileSet) ReceiveOnlyChangedSize() Counts {
+	return s.meta.Counts(protocol.LocalDeviceID, protocol.FlagLocalReceiveOnly)
 }
 
 func (s *FileSet) GlobalSize() Counts {
-	return s.meta.Counts(globalDeviceID)
+	global := s.meta.Counts(protocol.GlobalDeviceID, 0)
+	recvOnlyChanged := s.meta.Counts(protocol.GlobalDeviceID, protocol.FlagLocalReceiveOnly)
+	return global.Add(recvOnlyChanged)
 }
 
 func (s *FileSet) IndexID(device protocol.DeviceID) protocol.IndexID {
@@ -277,8 +268,8 @@ func (s *FileSet) SetIndexID(device protocol.DeviceID, id protocol.IndexID) {
 }
 
 func (s *FileSet) MtimeFS() *fs.MtimeFS {
-	prefix := s.db.mtimesKey([]byte(s.folder))
-	kv := NewNamespacedKV(s.db, string(prefix))
+	prefix := s.db.keyer.GenerateMtimesKey(nil, []byte(s.folder))
+	kv := NewNamespacedKV(s.db.Lowlevel, string(prefix))
 	return fs.NewMtimeFS(s.fs, kv)
 }
 
@@ -288,15 +279,24 @@ func (s *FileSet) ListDevices() []protocol.DeviceID {
 
 // DropFolder clears out all information related to the given folder from the
 // database.
-func DropFolder(db *Instance, folder string) {
+func DropFolder(ll *Lowlevel, folder string) {
+	db := newInstance(ll)
 	db.dropFolder([]byte(folder))
 	db.dropMtimes([]byte(folder))
 	db.dropFolderMeta([]byte(folder))
-	bm := &BlockMap{
-		db:     db,
-		folder: db.folderIdx.ID([]byte(folder)),
+
+	// Also clean out the folder ID mapping.
+	db.folderIdx.Delete([]byte(folder))
+}
+
+// DropDeltaIndexIDs removes all delta index IDs from the database.
+// This will cause a full index transmission on the next connection.
+func DropDeltaIndexIDs(db *Lowlevel) {
+	dbi := db.NewIterator(util.BytesPrefix([]byte{KeyTypeIndexID}), nil)
+	defer dbi.Release()
+	for dbi.Next() {
+		db.Delete(dbi.Key(), nil)
 	}
-	bm.Drop()
 }
 
 func normalizeFilenames(fs []protocol.FileInfo) {

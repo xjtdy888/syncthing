@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"log"
-	"math/rand"
 	"mime"
 	"net"
 	"net/http"
@@ -29,6 +28,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/syncthing/syncthing/cmd/strelaypoolsrv/auto"
+	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/relay/client"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/tlsutil"
@@ -370,10 +370,7 @@ func handleGetRequest(w http.ResponseWriter, r *http.Request) {
 	mut.RUnlock()
 
 	// Shuffle
-	for i := range relays {
-		j := rand.Intn(i + 1)
-		relays[i], relays[j] = relays[j], relays[i]
-	}
+	rand.Shuffle(relays)
 
 	json.NewEncoder(w).Encode(map[string][]*relay{
 		"relays": relays,
@@ -496,7 +493,7 @@ func handleRelayTest(request request) {
 
 	mut.Lock()
 	if stats != nil {
-		updateMetrics(request.relay.uri.Host, stats, location)
+		updateMetrics(request.relay.uri.Host, *stats, location)
 	}
 	request.relay.Stats = stats
 	request.relay.StatsRetrieved = time.Now()
@@ -636,7 +633,7 @@ func createTestCertificate() tls.Certificate {
 	}
 
 	certFile, keyFile := filepath.Join(tmpDir, "cert.pem"), filepath.Join(tmpDir, "key.pem")
-	cert, err := tlsutil.NewCertificate(certFile, keyFile, "relaypoolsrv", 3072)
+	cert, err := tlsutil.NewCertificate(certFile, keyFile, "relaypoolsrv")
 	if err != nil {
 		log.Fatalln("Failed to create test X509 key pair:", err)
 	}

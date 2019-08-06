@@ -12,8 +12,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/syncthing/syncthing/lib/rand"
 )
 
 func setup(t *testing.T) (*BasicFilesystem, string) {
@@ -52,6 +55,54 @@ func TestChmodFile(t *testing.T) {
 
 	if stat, err := os.Stat(path); err != nil || stat.Mode()&os.ModePerm != 0444 {
 		t.Errorf("wrong perm: %t %#o", err == nil, stat.Mode()&os.ModePerm)
+	}
+}
+
+func TestChownFile(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Not supported on Windows")
+		return
+	}
+	if os.Getuid() != 0 {
+		// We are not root. No expectation of being able to chown. Our tests
+		// typically don't run with CAP_FOWNER.
+		t.Skip("Test not possible")
+		return
+	}
+
+	fs, dir := setup(t)
+	path := filepath.Join(dir, "file")
+	defer os.RemoveAll(dir)
+
+	defer os.Chmod(path, 0666)
+
+	fd, err := os.Create(path)
+	if err != nil {
+		t.Error("Unexpected error:", err)
+	}
+	fd.Close()
+
+	_, err = fs.Lstat("file")
+	if err != nil {
+		t.Error("Unexpected error:", err)
+	}
+
+	newUID := 1000 + rand.Intn(30000)
+	newGID := 1000 + rand.Intn(30000)
+
+	if err := fs.Lchown("file", newUID, newGID); err != nil {
+		t.Error("Unexpected error:", err)
+	}
+
+	info, err := fs.Lstat("file")
+	if err != nil {
+		t.Error("Unexpected error:", err)
+	}
+	if info.Owner() != newUID {
+		t.Errorf("Incorrect owner, expected %d but got %d", newUID, info.Owner())
+	}
+	if info.Group() != newGID {
+		t.Errorf("Incorrect group, expected %d but got %d", newGID, info.Group())
 	}
 }
 
@@ -331,10 +382,14 @@ func TestRooted(t *testing.T) {
 		{"baz/foo/", "/bar/baz", "baz/foo/bar/baz", true},
 
 		// Not escape attempts, but oddly formatted relative paths.
-		{"foo", "", "foo/", true},
-		{"foo", "/", "foo/", true},
-		{"foo", "/..", "foo/", true},
+		{"foo", "", "foo", true},
+		{"foo", "/", "foo", true},
+		{"foo", "/..", "foo", true},
 		{"foo", "./bar", "foo/bar", true},
+		{"foo/", "", "foo", true},
+		{"foo/", "/", "foo", true},
+		{"foo/", "/..", "foo", true},
+		{"foo/", "./bar", "foo/bar", true},
 		{"baz/foo", "./bar", "baz/foo/bar", true},
 		{"foo", "./bar/baz", "foo/bar/baz", true},
 		{"baz/foo", "./bar/baz", "baz/foo/bar/baz", true},
@@ -395,6 +450,10 @@ func TestRooted(t *testing.T) {
 			{`\\?\c:\`, `\\foo`, ``, false},
 			{`\\?\c:\`, ``, `\\?\c:\`, true},
 			{`\\?\c:\`, `\`, `\\?\c:\`, true},
+			{`\\?\c:\test`, `.`, `\\?\c:\test`, true},
+			{`c:\test`, `.`, `c:\test`, true},
+			{`\\?\c:\test`, `/`, `\\?\c:\test`, true},
+			{`c:\test`, ``, `c:\test`, true},
 
 			// makes no sense, but will be treated simply as a bad filename
 			{`c:\foo`, `d:\bar`, `c:\foo\d:\bar`, true},
@@ -448,4 +507,68 @@ func TestRooted(t *testing.T) {
 			continue
 		}
 	}
+}
+
+func TestNewBasicFilesystem(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("non-windows root paths")
+	}
+
+	testCases := []struct {
+		input        string
+		expectedRoot string
+		expectedURI  string
+	}{
+		{"/foo/bar/baz", "/foo/bar/baz", "/foo/bar/baz"},
+		{"/foo/bar/baz/", "/foo/bar/baz", "/foo/bar/baz"},
+		{"", "/", "/"},
+		{"/", "/", "/"},
+	}
+
+	for _, testCase := range testCases {
+		fs := newBasicFilesystem(testCase.input)
+		if fs.root != testCase.expectedRoot {
+			t.Errorf("root %q != %q", fs.root, testCase.expectedRoot)
+		}
+		if fs.URI() != testCase.expectedURI {
+			t.Errorf("uri %q != %q", fs.URI(), testCase.expectedURI)
+		}
+	}
+
+	fs := newBasicFilesystem("relative/path")
+	if fs.root == "relative/path" || !strings.HasPrefix(fs.root, string(PathSeparator)) {
+		t.Errorf(`newBasicFilesystem("relative/path").root == %q, expected absolutification`, fs.root)
+	}
+}
+
+func TestRel(t *testing.T) {
+	testCases := []struct {
+		root        string
+		abs         string
+		expectedRel string
+	}{
+		{"/", "/", ""},
+		{"/", "/test", "test"},
+		{"/", "/Test", "Test"},
+		{"/Test", "/Test/test", "test"},
+	}
+	if runtime.GOOS == "windows" {
+		for i := range testCases {
+			testCases[i].root = filepath.FromSlash(testCases[i].root)
+			testCases[i].abs = filepath.FromSlash(testCases[i].abs)
+			testCases[i].expectedRel = filepath.FromSlash(testCases[i].expectedRel)
+		}
+	}
+
+	for _, tc := range testCases {
+		if res := rel(tc.abs, tc.root); res != tc.expectedRel {
+			t.Errorf(`rel("%v", "%v") == "%v", expected "%v"`, tc.abs, tc.root, res, tc.expectedRel)
+		}
+	}
+}
+
+func TestBasicWalkSkipSymlink(t *testing.T) {
+	_, dir := setup(t)
+	defer os.RemoveAll(dir)
+	testWalkSkipSymlink(t, FilesystemTypeBasic, dir)
 }

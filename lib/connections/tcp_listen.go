@@ -16,6 +16,7 @@ import (
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/nat"
+	"github.com/syncthing/syncthing/lib/util"
 )
 
 func init() {
@@ -26,43 +27,32 @@ func init() {
 }
 
 type tcpListener struct {
+	util.ServiceWithError
 	onAddressesChangedNotifier
 
 	uri     *url.URL
-	cfg     *config.Wrapper
+	cfg     config.Wrapper
 	tlsCfg  *tls.Config
-	stop    chan struct{}
 	conns   chan internalConn
 	factory listenerFactory
 
 	natService *nat.Service
 	mapping    *nat.Mapping
 
-	err error
 	mut sync.RWMutex
 }
 
-func (t *tcpListener) Serve() {
-	t.mut.Lock()
-	t.err = nil
-	t.mut.Unlock()
-
+func (t *tcpListener) serve(stop chan struct{}) error {
 	tcaddr, err := net.ResolveTCPAddr(t.uri.Scheme, t.uri.Host)
 	if err != nil {
-		t.mut.Lock()
-		t.err = err
-		t.mut.Unlock()
 		l.Infoln("Listen (BEP/tcp):", err)
-		return
+		return err
 	}
 
 	listener, err := net.ListenTCP(t.uri.Scheme, tcaddr)
 	if err != nil {
-		t.mut.Lock()
-		t.err = err
-		t.mut.Unlock()
 		l.Infoln("Listen (BEP/tcp):", err)
-		return
+		return err
 	}
 	defer listener.Close()
 
@@ -79,27 +69,41 @@ func (t *tcpListener) Serve() {
 	t.mapping = mapping
 	t.mut.Unlock()
 
+	acceptFailures := 0
+	const maxAcceptFailures = 10
+
 	for {
 		listener.SetDeadline(time.Now().Add(time.Second))
 		conn, err := listener.Accept()
 		select {
-		case <-t.stop:
+		case <-stop:
 			if err == nil {
 				conn.Close()
 			}
 			t.mut.Lock()
 			t.mapping = nil
 			t.mut.Unlock()
-			return
+			return nil
 		default:
 		}
 		if err != nil {
 			if err, ok := err.(*net.OpError); !ok || !err.Timeout() {
 				l.Warnln("Listen (BEP/tcp): Accepting connection:", err)
+
+				acceptFailures++
+				if acceptFailures > maxAcceptFailures {
+					// Return to restart the listener, because something
+					// seems permanently damaged.
+					return err
+				}
+
+				// Slightly increased delay for each failure.
+				time.Sleep(time.Duration(acceptFailures) * time.Second)
 			}
 			continue
 		}
 
+		acceptFailures = 0
 		l.Debugln("Listen (BEP/tcp): connect from", conn.RemoteAddr())
 
 		if err := dialer.SetTCPOptions(conn); err != nil {
@@ -121,10 +125,6 @@ func (t *tcpListener) Serve() {
 
 		t.conns <- internalConn{tc, connTypeTCPServer, tcpPriority}
 	}
-}
-
-func (t *tcpListener) Stop() {
-	close(t.stop)
 }
 
 func (t *tcpListener) URI() *url.URL {
@@ -160,13 +160,6 @@ func (t *tcpListener) LANAddresses() []*url.URL {
 	return []*url.URL{t.uri}
 }
 
-func (t *tcpListener) Error() error {
-	t.mut.RLock()
-	err := t.err
-	t.mut.RUnlock()
-	return err
-}
-
 func (t *tcpListener) String() string {
 	return t.uri.String()
 }
@@ -181,16 +174,17 @@ func (t *tcpListener) NATType() string {
 
 type tcpListenerFactory struct{}
 
-func (f *tcpListenerFactory) New(uri *url.URL, cfg *config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
-	return &tcpListener{
+func (f *tcpListenerFactory) New(uri *url.URL, cfg config.Wrapper, tlsCfg *tls.Config, conns chan internalConn, natService *nat.Service) genericListener {
+	l := &tcpListener{
 		uri:        fixupPort(uri, config.DefaultTCPPort),
 		cfg:        cfg,
 		tlsCfg:     tlsCfg,
 		conns:      conns,
 		natService: natService,
-		stop:       make(chan struct{}),
 		factory:    f,
 	}
+	l.ServiceWithError = util.AsServiceWithError(l.serve)
+	return l
 }
 
 func (tcpListenerFactory) Valid(_ config.Configuration) error {

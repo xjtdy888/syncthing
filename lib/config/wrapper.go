@@ -8,13 +8,13 @@ package config
 
 import (
 	"os"
-	"path/filepath"
 	"sync/atomic"
+	"time"
 
 	"github.com/syncthing/syncthing/lib/events"
-	"github.com/syncthing/syncthing/lib/fs"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
+	"github.com/syncthing/syncthing/lib/rand"
 	"github.com/syncthing/syncthing/lib/sync"
 	"github.com/syncthing/syncthing/lib/util"
 )
@@ -53,37 +53,98 @@ type noopWaiter struct{}
 
 func (noopWaiter) Wait() {}
 
-// A wrapper around a Configuration that manages loads, saves and published
+// A Wrapper around a Configuration that manages loads, saves and published
 // notifications of changes to registered Handlers
+type Wrapper interface {
+	MyName() string
+	ConfigPath() string
 
-type Wrapper struct {
+	RawCopy() Configuration
+	Replace(cfg Configuration) (Waiter, error)
+	RequiresRestart() bool
+	Save() error
+
+	GUI() GUIConfiguration
+	SetGUI(gui GUIConfiguration) (Waiter, error)
+	LDAP() LDAPConfiguration
+
+	Options() OptionsConfiguration
+	SetOptions(opts OptionsConfiguration) (Waiter, error)
+
+	Folder(id string) (FolderConfiguration, bool)
+	Folders() map[string]FolderConfiguration
+	FolderList() []FolderConfiguration
+	SetFolder(fld FolderConfiguration) (Waiter, error)
+
+	Device(id protocol.DeviceID) (DeviceConfiguration, bool)
+	Devices() map[protocol.DeviceID]DeviceConfiguration
+	RemoveDevice(id protocol.DeviceID) (Waiter, error)
+	SetDevice(DeviceConfiguration) (Waiter, error)
+	SetDevices([]DeviceConfiguration) (Waiter, error)
+
+	AddOrUpdatePendingDevice(device protocol.DeviceID, name, address string)
+	AddOrUpdatePendingFolder(id, label string, device protocol.DeviceID)
+	IgnoredDevice(id protocol.DeviceID) bool
+	IgnoredFolder(device protocol.DeviceID, folder string) bool
+
+	ListenAddresses() []string
+	GlobalDiscoveryServers() []string
+	StunServers() []string
+
+	Subscribe(c Committer)
+	Unsubscribe(c Committer)
+}
+
+type wrapper struct {
 	cfg  Configuration
 	path string
 
 	deviceMap map[protocol.DeviceID]DeviceConfiguration
 	folderMap map[string]FolderConfiguration
-	replaces  chan Configuration
 	subs      []Committer
 	mut       sync.Mutex
 
 	requiresRestart uint32 // an atomic bool
 }
 
+func (w *wrapper) StunServers() []string {
+	var addresses []string
+	for _, addr := range w.cfg.Options.StunServers {
+		switch addr {
+		case "default":
+			defaultPrimaryAddresses := make([]string, len(DefaultPrimaryStunServers))
+			copy(defaultPrimaryAddresses, DefaultPrimaryStunServers)
+			rand.Shuffle(defaultPrimaryAddresses)
+			addresses = append(addresses, defaultPrimaryAddresses...)
+
+			defaultSecondaryAddresses := make([]string, len(DefaultSecondaryStunServers))
+			copy(defaultSecondaryAddresses, DefaultSecondaryStunServers)
+			rand.Shuffle(defaultSecondaryAddresses)
+			addresses = append(addresses, defaultSecondaryAddresses...)
+		default:
+			addresses = append(addresses, addr)
+		}
+	}
+
+	addresses = util.UniqueTrimmedStrings(addresses)
+
+	return addresses
+}
+
 // Wrap wraps an existing Configuration structure and ties it to a file on
 // disk.
-func Wrap(path string, cfg Configuration) *Wrapper {
-	w := &Wrapper{
+func Wrap(path string, cfg Configuration) Wrapper {
+	w := &wrapper{
 		cfg:  cfg,
 		path: path,
 		mut:  sync.NewMutex(),
 	}
-	w.replaces = make(chan Configuration)
 	return w
 }
 
 // Load loads an existing file on disk and returns a new configuration
 // wrapper.
-func Load(path string, myID protocol.DeviceID) (*Wrapper, error) {
+func Load(path string, myID protocol.DeviceID) (Wrapper, error) {
 	fd, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -98,19 +159,13 @@ func Load(path string, myID protocol.DeviceID) (*Wrapper, error) {
 	return Wrap(path, cfg), nil
 }
 
-func (w *Wrapper) ConfigPath() string {
+func (w *wrapper) ConfigPath() string {
 	return w.path
-}
-
-// Stop stops the Serve() loop. Set and Replace operations will panic after a
-// Stop.
-func (w *Wrapper) Stop() {
-	close(w.replaces)
 }
 
 // Subscribe registers the given handler to be called on any future
 // configuration changes.
-func (w *Wrapper) Subscribe(c Committer) {
+func (w *wrapper) Subscribe(c Committer) {
 	w.mut.Lock()
 	w.subs = append(w.subs, c)
 	w.mut.Unlock()
@@ -118,7 +173,7 @@ func (w *Wrapper) Subscribe(c Committer) {
 
 // Unsubscribe de-registers the given handler from any future calls to
 // configuration changes
-func (w *Wrapper) Unsubscribe(c Committer) {
+func (w *wrapper) Unsubscribe(c Committer) {
 	w.mut.Lock()
 	for i := range w.subs {
 		if w.subs[i] == c {
@@ -132,20 +187,20 @@ func (w *Wrapper) Unsubscribe(c Committer) {
 }
 
 // RawCopy returns a copy of the currently wrapped Configuration object.
-func (w *Wrapper) RawCopy() Configuration {
+func (w *wrapper) RawCopy() Configuration {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	return w.cfg.Copy()
 }
 
 // Replace swaps the current configuration object for the given one.
-func (w *Wrapper) Replace(cfg Configuration) (Waiter, error) {
+func (w *wrapper) Replace(cfg Configuration) (Waiter, error) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
-	return w.replaceLocked(cfg)
+	return w.replaceLocked(cfg.Copy())
 }
 
-func (w *Wrapper) replaceLocked(to Configuration) (Waiter, error) {
+func (w *wrapper) replaceLocked(to Configuration) (Waiter, error) {
 	from := w.cfg
 
 	if err := to.clean(); err != nil {
@@ -154,7 +209,7 @@ func (w *Wrapper) replaceLocked(to Configuration) (Waiter, error) {
 
 	for _, sub := range w.subs {
 		l.Debugln(sub, "verifying configuration")
-		if err := sub.VerifyConfiguration(from, to); err != nil {
+		if err := sub.VerifyConfiguration(from.Copy(), to.Copy()); err != nil {
 			l.Debugln(sub, "rejected config:", err)
 			return noopWaiter{}, err
 		}
@@ -164,22 +219,22 @@ func (w *Wrapper) replaceLocked(to Configuration) (Waiter, error) {
 	w.deviceMap = nil
 	w.folderMap = nil
 
-	return w.notifyListeners(from, to), nil
+	return w.notifyListeners(from.Copy(), to.Copy()), nil
 }
 
-func (w *Wrapper) notifyListeners(from, to Configuration) Waiter {
+func (w *wrapper) notifyListeners(from, to Configuration) Waiter {
 	wg := sync.NewWaitGroup()
 	wg.Add(len(w.subs))
 	for _, sub := range w.subs {
 		go func(commiter Committer) {
-			w.notifyListener(commiter, from.Copy(), to.Copy())
+			w.notifyListener(commiter, from, to)
 			wg.Done()
 		}(sub)
 	}
 	return wg
 }
 
-func (w *Wrapper) notifyListener(sub Committer, from, to Configuration) {
+func (w *wrapper) notifyListener(sub Committer, from, to Configuration) {
 	l.Debugln(sub, "committing configuration")
 	if !sub.CommitConfiguration(from, to) {
 		l.Debugln(sub, "requires restart")
@@ -187,15 +242,14 @@ func (w *Wrapper) notifyListener(sub Committer, from, to Configuration) {
 	}
 }
 
-// Devices returns a map of devices. Device structures should not be changed,
-// other than for the purpose of updating via SetDevice().
-func (w *Wrapper) Devices() map[protocol.DeviceID]DeviceConfiguration {
+// Devices returns a map of devices.
+func (w *wrapper) Devices() map[protocol.DeviceID]DeviceConfiguration {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	if w.deviceMap == nil {
 		w.deviceMap = make(map[protocol.DeviceID]DeviceConfiguration, len(w.cfg.Devices))
 		for _, dev := range w.cfg.Devices {
-			w.deviceMap[dev.DeviceID] = dev
+			w.deviceMap[dev.DeviceID] = dev.Copy()
 		}
 	}
 	return w.deviceMap
@@ -203,7 +257,7 @@ func (w *Wrapper) Devices() map[protocol.DeviceID]DeviceConfiguration {
 
 // SetDevices adds new devices to the configuration, or overwrites existing
 // devices with the same ID.
-func (w *Wrapper) SetDevices(devs []DeviceConfiguration) (Waiter, error) {
+func (w *wrapper) SetDevices(devs []DeviceConfiguration) (Waiter, error) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 
@@ -213,13 +267,13 @@ func (w *Wrapper) SetDevices(devs []DeviceConfiguration) (Waiter, error) {
 		replaced = false
 		for newIndex := range newCfg.Devices {
 			if newCfg.Devices[newIndex].DeviceID == devs[oldIndex].DeviceID {
-				newCfg.Devices[newIndex] = devs[oldIndex]
+				newCfg.Devices[newIndex] = devs[oldIndex].Copy()
 				replaced = true
 				break
 			}
 		}
 		if !replaced {
-			newCfg.Devices = append(newCfg.Devices, devs[oldIndex])
+			newCfg.Devices = append(newCfg.Devices, devs[oldIndex].Copy())
 		}
 	}
 
@@ -228,113 +282,112 @@ func (w *Wrapper) SetDevices(devs []DeviceConfiguration) (Waiter, error) {
 
 // SetDevice adds a new device to the configuration, or overwrites an existing
 // device with the same ID.
-func (w *Wrapper) SetDevice(dev DeviceConfiguration) (Waiter, error) {
+func (w *wrapper) SetDevice(dev DeviceConfiguration) (Waiter, error) {
 	return w.SetDevices([]DeviceConfiguration{dev})
 }
 
 // RemoveDevice removes the device from the configuration
-func (w *Wrapper) RemoveDevice(id protocol.DeviceID) (Waiter, error) {
+func (w *wrapper) RemoveDevice(id protocol.DeviceID) (Waiter, error) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 
 	newCfg := w.cfg.Copy()
-	removed := false
 	for i := range newCfg.Devices {
 		if newCfg.Devices[i].DeviceID == id {
 			newCfg.Devices = append(newCfg.Devices[:i], newCfg.Devices[i+1:]...)
-			removed = true
-			break
+			return w.replaceLocked(newCfg)
 		}
 	}
-	if !removed {
-		return noopWaiter{}, nil
-	}
 
-	return w.replaceLocked(newCfg)
+	return noopWaiter{}, nil
 }
 
 // Folders returns a map of folders. Folder structures should not be changed,
 // other than for the purpose of updating via SetFolder().
-func (w *Wrapper) Folders() map[string]FolderConfiguration {
+func (w *wrapper) Folders() map[string]FolderConfiguration {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	if w.folderMap == nil {
 		w.folderMap = make(map[string]FolderConfiguration, len(w.cfg.Folders))
 		for _, fld := range w.cfg.Folders {
-			w.folderMap[fld.ID] = fld
+			w.folderMap[fld.ID] = fld.Copy()
 		}
 	}
 	return w.folderMap
 }
 
 // FolderList returns a slice of folders.
-func (w *Wrapper) FolderList() []FolderConfiguration {
+func (w *wrapper) FolderList() []FolderConfiguration {
 	w.mut.Lock()
 	defer w.mut.Unlock()
-	return append([]FolderConfiguration(nil), w.cfg.Folders...)
+	return w.cfg.Copy().Folders
 }
 
 // SetFolder adds a new folder to the configuration, or overwrites an existing
 // folder with the same ID.
-func (w *Wrapper) SetFolder(fld FolderConfiguration) (Waiter, error) {
+func (w *wrapper) SetFolder(fld FolderConfiguration) (Waiter, error) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 
 	newCfg := w.cfg.Copy()
-	replaced := false
+
 	for i := range newCfg.Folders {
 		if newCfg.Folders[i].ID == fld.ID {
 			newCfg.Folders[i] = fld
-			replaced = true
-			break
+			return w.replaceLocked(newCfg)
 		}
 	}
-	if !replaced {
-		newCfg.Folders = append(w.cfg.Folders, fld)
-	}
+
+	newCfg.Folders = append(newCfg.Folders, fld)
 
 	return w.replaceLocked(newCfg)
 }
 
 // Options returns the current options configuration object.
-func (w *Wrapper) Options() OptionsConfiguration {
+func (w *wrapper) Options() OptionsConfiguration {
 	w.mut.Lock()
 	defer w.mut.Unlock()
-	return w.cfg.Options
+	return w.cfg.Options.Copy()
 }
 
 // SetOptions replaces the current options configuration object.
-func (w *Wrapper) SetOptions(opts OptionsConfiguration) (Waiter, error) {
+func (w *wrapper) SetOptions(opts OptionsConfiguration) (Waiter, error) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	newCfg := w.cfg.Copy()
-	newCfg.Options = opts
+	newCfg.Options = opts.Copy()
 	return w.replaceLocked(newCfg)
 }
 
-// GUI returns the current GUI configuration object.
-func (w *Wrapper) GUI() GUIConfiguration {
+func (w *wrapper) LDAP() LDAPConfiguration {
 	w.mut.Lock()
 	defer w.mut.Unlock()
-	return w.cfg.GUI
+	return w.cfg.LDAP.Copy()
+}
+
+// GUI returns the current GUI configuration object.
+func (w *wrapper) GUI() GUIConfiguration {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+	return w.cfg.GUI.Copy()
 }
 
 // SetGUI replaces the current GUI configuration object.
-func (w *Wrapper) SetGUI(gui GUIConfiguration) (Waiter, error) {
+func (w *wrapper) SetGUI(gui GUIConfiguration) (Waiter, error) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	newCfg := w.cfg.Copy()
-	newCfg.GUI = gui
+	newCfg.GUI = gui.Copy()
 	return w.replaceLocked(newCfg)
 }
 
 // IgnoredDevice returns whether or not connection attempts from the given
 // device should be silently ignored.
-func (w *Wrapper) IgnoredDevice(id protocol.DeviceID) bool {
+func (w *wrapper) IgnoredDevice(id protocol.DeviceID) bool {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	for _, device := range w.cfg.IgnoredDevices {
-		if device == id {
+		if device.ID == id {
 			return true
 		}
 	}
@@ -343,43 +396,43 @@ func (w *Wrapper) IgnoredDevice(id protocol.DeviceID) bool {
 
 // IgnoredFolder returns whether or not share attempts for the given
 // folder should be silently ignored.
-func (w *Wrapper) IgnoredFolder(folder string) bool {
-	w.mut.Lock()
-	defer w.mut.Unlock()
-	for _, nfolder := range w.cfg.IgnoredFolders {
-		if folder == nfolder {
-			return true
-		}
+func (w *wrapper) IgnoredFolder(device protocol.DeviceID, folder string) bool {
+	dev, ok := w.Device(device)
+	if !ok {
+		return false
 	}
-	return false
+	return dev.IgnoredFolder(folder)
 }
 
 // Device returns the configuration for the given device and an "ok" bool.
-func (w *Wrapper) Device(id protocol.DeviceID) (DeviceConfiguration, bool) {
+func (w *wrapper) Device(id protocol.DeviceID) (DeviceConfiguration, bool) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	for _, device := range w.cfg.Devices {
 		if device.DeviceID == id {
-			return device, true
+			return device.Copy(), true
 		}
 	}
 	return DeviceConfiguration{}, false
 }
 
 // Folder returns the configuration for the given folder and an "ok" bool.
-func (w *Wrapper) Folder(id string) (FolderConfiguration, bool) {
+func (w *wrapper) Folder(id string) (FolderConfiguration, bool) {
 	w.mut.Lock()
 	defer w.mut.Unlock()
 	for _, folder := range w.cfg.Folders {
 		if folder.ID == id {
-			return folder, true
+			return folder.Copy(), true
 		}
 	}
 	return FolderConfiguration{}, false
 }
 
 // Save writes the configuration to disk, and generates a ConfigSaved event.
-func (w *Wrapper) Save() error {
+func (w *wrapper) Save() error {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+
 	fd, err := osutil.CreateAtomic(w.path)
 	if err != nil {
 		l.Debugln("CreateAtomic:", err)
@@ -401,9 +454,9 @@ func (w *Wrapper) Save() error {
 	return nil
 }
 
-func (w *Wrapper) GlobalDiscoveryServers() []string {
+func (w *wrapper) GlobalDiscoveryServers() []string {
 	var servers []string
-	for _, srv := range w.cfg.Options.GlobalAnnServers {
+	for _, srv := range w.Options().GlobalAnnServers {
 		switch srv {
 		case "default":
 			servers = append(servers, DefaultDiscoveryServers...)
@@ -415,12 +468,12 @@ func (w *Wrapper) GlobalDiscoveryServers() []string {
 			servers = append(servers, srv)
 		}
 	}
-	return util.UniqueStrings(servers)
+	return util.UniqueTrimmedStrings(servers)
 }
 
-func (w *Wrapper) ListenAddresses() []string {
+func (w *wrapper) ListenAddresses() []string {
 	var addresses []string
-	for _, addr := range w.cfg.Options.ListenAddresses {
+	for _, addr := range w.Options().ListenAddresses {
 		switch addr {
 		case "default":
 			addresses = append(addresses, DefaultListenAddresses...)
@@ -428,18 +481,18 @@ func (w *Wrapper) ListenAddresses() []string {
 			addresses = append(addresses, addr)
 		}
 	}
-	return util.UniqueStrings(addresses)
+	return util.UniqueTrimmedStrings(addresses)
 }
 
-func (w *Wrapper) RequiresRestart() bool {
+func (w *wrapper) RequiresRestart() bool {
 	return atomic.LoadUint32(&w.requiresRestart) != 0
 }
 
-func (w *Wrapper) setRequiresRestart() {
+func (w *wrapper) setRequiresRestart() {
 	atomic.StoreUint32(&w.requiresRestart, 1)
 }
 
-func (w *Wrapper) MyName() string {
+func (w *wrapper) MyName() string {
 	w.mut.Lock()
 	myID := w.cfg.MyID
 	w.mut.Unlock()
@@ -447,8 +500,48 @@ func (w *Wrapper) MyName() string {
 	return cfg.Name
 }
 
-// CheckHomeFreeSpace returns nil if the home disk has the required amount of
-// free space, or if home disk free space checking is disabled.
-func (w *Wrapper) CheckHomeFreeSpace() error {
-	return checkFreeSpace(w.Options().MinHomeDiskFree, fs.NewFilesystem(fs.FilesystemTypeBasic, filepath.Dir(w.ConfigPath())))
+func (w *wrapper) AddOrUpdatePendingDevice(device protocol.DeviceID, name, address string) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+
+	for i := range w.cfg.PendingDevices {
+		if w.cfg.PendingDevices[i].ID == device {
+			w.cfg.PendingDevices[i].Time = time.Now().Round(time.Second)
+			w.cfg.PendingDevices[i].Name = name
+			w.cfg.PendingDevices[i].Address = address
+			return
+		}
+	}
+
+	w.cfg.PendingDevices = append(w.cfg.PendingDevices, ObservedDevice{
+		Time:    time.Now().Round(time.Second),
+		ID:      device,
+		Name:    name,
+		Address: address,
+	})
+}
+
+func (w *wrapper) AddOrUpdatePendingFolder(id, label string, device protocol.DeviceID) {
+	w.mut.Lock()
+	defer w.mut.Unlock()
+
+	for i := range w.cfg.Devices {
+		if w.cfg.Devices[i].DeviceID == device {
+			for j := range w.cfg.Devices[i].PendingFolders {
+				if w.cfg.Devices[i].PendingFolders[j].ID == id {
+					w.cfg.Devices[i].PendingFolders[j].Label = label
+					w.cfg.Devices[i].PendingFolders[j].Time = time.Now().Round(time.Second)
+					return
+				}
+			}
+			w.cfg.Devices[i].PendingFolders = append(w.cfg.Devices[i].PendingFolders, ObservedFolder{
+				Time:  time.Now().Round(time.Second),
+				ID:    id,
+				Label: label,
+			})
+			return
+		}
+	}
+
+	panic("bug: adding pending folder for non-existing device")
 }

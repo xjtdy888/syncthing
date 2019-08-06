@@ -44,6 +44,10 @@ func TestWindowsPaths(t *testing.T) {
 
 func TestResolveWindows83(t *testing.T) {
 	fs, dir := setup(t)
+	if isMaybeWin83(dir) {
+		dir = fs.resolveWin83(dir)
+		fs = newBasicFilesystem(dir)
+	}
 	defer os.RemoveAll(dir)
 
 	shortAbs, _ := fs.rooted("LFDATA~1")
@@ -71,6 +75,10 @@ func TestResolveWindows83(t *testing.T) {
 
 func TestIsWindows83(t *testing.T) {
 	fs, dir := setup(t)
+	if isMaybeWin83(dir) {
+		dir = fs.resolveWin83(dir)
+		fs = newBasicFilesystem(dir)
+	}
 	defer os.RemoveAll(dir)
 
 	tempTop, _ := fs.rooted(TempName("baz"))
@@ -87,6 +95,86 @@ func TestIsWindows83(t *testing.T) {
 	for _, f := range []string{short, tempAndShort} {
 		if !isMaybeWin83(f) {
 			t.Errorf(`"%v" is not a windows 8.3 path"`, f)
+		}
+	}
+}
+
+func TestRelUnrootedCheckedWindows(t *testing.T) {
+	testCases := []struct {
+		root        string
+		abs         string
+		expectedRel string
+	}{
+		{`c:\`, `c:\foo`, `foo`},
+		{`C:\`, `c:\foo`, `foo`},
+		{`C:\`, `C:\foo`, `foo`},
+		{`c:\`, `C:\foo`, `foo`},
+		{`\\?c:\`, `\\?c:\foo`, `foo`},
+		{`\\?C:\`, `\\?c:\foo`, `foo`},
+		{`\\?C:\`, `\\?C:\foo`, `foo`},
+		{`\\?c:\`, `\\?C:\foo`, `foo`},
+		{`c:\foo`, `c:\foo\bar`, `bar`},
+		{`c:\foo`, `c:\foo\bAr`, `bAr`},
+		{`c:\foO`, `c:\Foo\bar`, `bar`},
+		{`c:\foO`, `c:\fOo\bAr`, `bAr`},
+		{`c:\foO`, `c:\fOo`, ``},
+		{`C:\foO`, `c:\fOo`, ``},
+	}
+
+	for _, tc := range testCases {
+		if res := rel(tc.abs, tc.root); res != tc.expectedRel {
+			t.Errorf(`rel("%v", "%v") == "%v", expected "%v"`, tc.abs, tc.root, res, tc.expectedRel)
+		}
+
+		// unrootedChecked really just wraps rel, and does not care about
+		// the actual root of that filesystem, but should not return an error
+		// on these test cases.
+		for _, root := range []string{tc.root, strings.ToLower(tc.root), strings.ToUpper(tc.root)} {
+			fs := BasicFilesystem{root: root}
+			if res, err := fs.unrootedChecked(tc.abs, tc.root); err != nil {
+				t.Errorf(`Unexpected error from unrootedChecked("%v", "%v"): %v (fs.root: %v)`, tc.abs, tc.root, err, root)
+			} else if res != tc.expectedRel {
+				t.Errorf(`unrootedChecked("%v", "%v") == "%v", expected "%v" (fs.root: %v)`, tc.abs, tc.root, res, tc.expectedRel, root)
+			}
+		}
+	}
+}
+
+func TestGetFinalPath(t *testing.T) {
+	testCases := []struct {
+		input         string
+		expectedPath  string
+		eqToEvalSyml  bool
+		ignoreMissing bool
+	}{
+		{`c:\`, `C:\`, true, false},
+		{`\\?\c:\`, `C:\`, false, false},
+		{`c:\wInDows\sYstEm32`, `C:\Windows\System32`, true, false},
+		{`c:\parent\child`, `C:\parent\child`, false, true},
+	}
+
+	for _, testCase := range testCases {
+		out, err := getFinalPathName(testCase.input)
+		if err != nil {
+			if testCase.ignoreMissing && os.IsNotExist(err) {
+				continue
+			}
+			t.Errorf("getFinalPathName failed at %q with error %s", testCase.input, err)
+		}
+		// Trim UNC prefix
+		if strings.HasPrefix(out, `\\?\UNC\`) {
+			out = `\` + out[7:]
+		} else {
+			out = strings.TrimPrefix(out, `\\?\`)
+		}
+		if out != testCase.expectedPath {
+			t.Errorf("getFinalPathName got wrong path: %q (expected %q)", out, testCase.expectedPath)
+		}
+		if testCase.eqToEvalSyml {
+			evlPath, err1 := filepath.EvalSymlinks(testCase.input)
+			if err1 != nil || out != evlPath {
+				t.Errorf("EvalSymlinks got different results %q %s", evlPath, err1)
+			}
 		}
 	}
 }

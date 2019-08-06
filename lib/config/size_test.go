@@ -6,7 +6,28 @@
 
 package config
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/syncthing/syncthing/lib/util"
+)
+
+type TestStruct struct {
+	Size Size `default:"10%"`
+}
+
+func TestSizeDefaults(t *testing.T) {
+	x := &TestStruct{}
+
+	util.SetDefaults(x)
+
+	if !x.Size.Percentage() {
+		t.Error("not percentage")
+	}
+	if x.Size.Value != 10 {
+		t.Error("not ten")
+	}
+}
 
 func TestParseSize(t *testing.T) {
 	cases := []struct {
@@ -67,6 +88,45 @@ func TestParseSize(t *testing.T) {
 		}
 		if size.Percentage() != tc.pct {
 			t.Errorf("Incorrect percentage bool in UnmarshalText(%q): %v, wanted %v", tc.in, size.Percentage(), tc.pct)
+		}
+	}
+}
+
+func TestFormatSI(t *testing.T) {
+	cases := []struct {
+		bytes  int64
+		result string
+	}{
+		{
+			bytes:  0,
+			result: "0 ", // space for unit
+		},
+		{
+			bytes:  999,
+			result: "999 ",
+		},
+		{
+			bytes:  1000,
+			result: "1.0 K",
+		},
+		{
+			bytes:  1023 * 1000,
+			result: "1.0 M",
+		},
+		{
+			bytes:  5 * 1000 * 1000 * 1000,
+			result: "5.0 G",
+		},
+		{
+			bytes:  50000 * 1000 * 1000 * 1000 * 1000,
+			result: "50000.0 T",
+		},
+	}
+
+	for _, tc := range cases {
+		res := formatSI(tc.bytes)
+		if res != tc.result {
+			t.Errorf("formatSI(%d) => %q, expected %q", tc.bytes, res, tc.result)
 		}
 	}
 }

@@ -14,6 +14,8 @@ import (
 
 	"github.com/thejerf/suture"
 	"golang.org/x/net/ipv6"
+
+	"github.com/syncthing/syncthing/lib/util"
 )
 
 type Multicast struct {
@@ -36,6 +38,7 @@ func NewMulticast(addr string) *Multicast {
 			Log: func(line string) {
 				l.Debugln(line)
 			},
+			PassThroughPanics: true,
 		}),
 		inbox:  make(chan []byte),
 		outbox: make(chan recv, 16),
@@ -44,15 +47,15 @@ func NewMulticast(addr string) *Multicast {
 	m.mr = &multicastReader{
 		addr:   addr,
 		outbox: m.outbox,
-		stop:   make(chan struct{}),
 	}
+	m.mr.ServiceWithError = util.AsServiceWithError(m.mr.serve)
 	m.Add(m.mr)
 
 	m.mw = &multicastWriter{
 		addr:  addr,
 		inbox: m.inbox,
-		stop:  make(chan struct{}),
 	}
+	m.mw.ServiceWithError = util.AsServiceWithError(m.mw.serve)
 	m.Add(m.mw)
 
 	return m
@@ -75,29 +78,35 @@ func (m *Multicast) Error() error {
 }
 
 type multicastWriter struct {
+	util.ServiceWithError
 	addr  string
 	inbox <-chan []byte
-	errorHolder
-	stop chan struct{}
 }
 
-func (w *multicastWriter) Serve() {
+func (w *multicastWriter) serve(stop chan struct{}) error {
 	l.Debugln(w, "starting")
 	defer l.Debugln(w, "stopping")
 
 	gaddr, err := net.ResolveUDPAddr("udp6", w.addr)
 	if err != nil {
 		l.Debugln(err)
-		w.setError(err)
-		return
+		return err
 	}
 
 	conn, err := net.ListenPacket("udp6", ":0")
 	if err != nil {
 		l.Debugln(err)
-		w.setError(err)
-		return
+		return err
 	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-stop:
+		case <-done:
+		}
+		conn.Close()
+	}()
 
 	pconn := ipv6.NewPacketConn(conn)
 
@@ -105,12 +114,18 @@ func (w *multicastWriter) Serve() {
 		HopLimit: 1,
 	}
 
-	for bs := range w.inbox {
+	for {
+		var bs []byte
+		select {
+		case bs = <-w.inbox:
+		case <-stop:
+			return nil
+		}
+
 		intfs, err := net.Interfaces()
 		if err != nil {
 			l.Debugln(err)
-			w.setError(err)
-			return
+			return err
 		}
 
 		success := 0
@@ -122,26 +137,25 @@ func (w *multicastWriter) Serve() {
 
 			if err != nil {
 				l.Debugln(err, "on write to", gaddr, intf.Name)
-				w.setError(err)
+				w.SetError(err)
 				continue
 			}
 
 			l.Debugf("sent %d bytes to %v on %s", len(bs), gaddr, intf.Name)
 
 			success++
+
+			select {
+			case <-stop:
+				return nil
+			default:
+			}
 		}
 
 		if success > 0 {
-			w.setError(nil)
-		} else {
-			l.Debugln(err)
-			w.setError(err)
+			w.SetError(nil)
 		}
 	}
-}
-
-func (w *multicastWriter) Stop() {
-	close(w.stop)
 }
 
 func (w *multicastWriter) String() string {
@@ -149,35 +163,40 @@ func (w *multicastWriter) String() string {
 }
 
 type multicastReader struct {
+	util.ServiceWithError
 	addr   string
 	outbox chan<- recv
-	errorHolder
-	stop chan struct{}
 }
 
-func (r *multicastReader) Serve() {
+func (r *multicastReader) serve(stop chan struct{}) error {
 	l.Debugln(r, "starting")
 	defer l.Debugln(r, "stopping")
 
 	gaddr, err := net.ResolveUDPAddr("udp6", r.addr)
 	if err != nil {
 		l.Debugln(err)
-		r.setError(err)
-		return
+		return err
 	}
 
 	conn, err := net.ListenPacket("udp6", r.addr)
 	if err != nil {
 		l.Debugln(err)
-		r.setError(err)
-		return
+		return err
 	}
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		select {
+		case <-stop:
+		case <-done:
+		}
+		conn.Close()
+	}()
 
 	intfs, err := net.Interfaces()
 	if err != nil {
 		l.Debugln(err)
-		r.setError(err)
-		return
+		return err
 	}
 
 	pconn := ipv6.NewPacketConn(conn)
@@ -194,16 +213,20 @@ func (r *multicastReader) Serve() {
 
 	if joined == 0 {
 		l.Debugln("no multicast interfaces available")
-		r.setError(errors.New("no multicast interfaces available"))
-		return
+		return errors.New("no multicast interfaces available")
 	}
 
 	bs := make([]byte, 65536)
 	for {
+		select {
+		case <-stop:
+			return nil
+		default:
+		}
 		n, _, addr, err := pconn.ReadFrom(bs)
 		if err != nil {
 			l.Debugln(err)
-			r.setError(err)
+			r.SetError(err)
 			continue
 		}
 		l.Debugf("recv %d bytes from %s", n, addr)
@@ -216,10 +239,6 @@ func (r *multicastReader) Serve() {
 			l.Debugln("dropping message")
 		}
 	}
-}
-
-func (r *multicastReader) Stop() {
-	close(r.stop)
 }
 
 func (r *multicastReader) String() string {

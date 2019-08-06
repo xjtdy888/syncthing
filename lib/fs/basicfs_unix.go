@@ -8,7 +8,11 @@
 
 package fs
 
-import "os"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
 
 func (BasicFilesystem) SymlinksSupported() bool {
 	return true
@@ -52,6 +56,38 @@ func (f *BasicFilesystem) Roots() ([]string, error) {
 	return []string{"/"}, nil
 }
 
-func (f *BasicFilesystem) resolveWin83(absPath string) string {
-	return absPath
+// unrootedChecked returns the path relative to the folder root (same as
+// unrooted) or an error if the given path is not a subpath and handles the
+// special case when the given path is the folder root without a trailing
+// pathseparator.
+func (f *BasicFilesystem) unrootedChecked(absPath, root string) (string, *ErrWatchEventOutsideRoot) {
+	if absPath+string(PathSeparator) == root {
+		return ".", nil
+	}
+	if !strings.HasPrefix(absPath, root) {
+		return "", f.newErrWatchEventOutsideRoot(absPath, root)
+	}
+	return rel(absPath, root), nil
+}
+
+func rel(path, prefix string) string {
+	return strings.TrimPrefix(strings.TrimPrefix(path, prefix), string(PathSeparator))
+}
+
+var evalSymlinks = filepath.EvalSymlinks
+
+// watchPaths adjust the folder root for use with the notify backend and the
+// corresponding absolute path to be passed to notify to watch name.
+func (f *BasicFilesystem) watchPaths(name string) (string, string, error) {
+	root, err := evalSymlinks(f.root)
+	if err != nil {
+		return "", "", err
+	}
+
+	absName, err := rooted(name, root)
+	if err != nil {
+		return "", "", err
+	}
+
+	return filepath.Join(absName, "..."), root, nil
 }

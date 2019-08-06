@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"time"
 
 	"github.com/syncthing/syncthing/lib/fs"
 
@@ -76,9 +77,11 @@ func (v External) Archive(filePath string) error {
 	}
 
 	for i, word := range words {
-		if replacement, ok := context[word]; ok {
-			words[i] = replacement
+		for key, val := range context {
+			word = strings.Replace(word, key, val, -1)
 		}
+
+		words[i] = word
 	}
 
 	cmd := exec.Command(words[0], words[1:]...)
@@ -102,4 +105,12 @@ func (v External) Archive(filePath string) error {
 		return nil
 	}
 	return errors.New("Versioner: file was not removed by external script")
+}
+
+func (v External) GetVersions() (map[string][]FileVersion, error) {
+	return nil, ErrRestorationNotSupported
+}
+
+func (v External) Restore(filePath string, versionTime time.Time) error {
+	return ErrRestorationNotSupported
 }

@@ -77,7 +77,7 @@ func TestGlobalOverHTTP(t *testing.T) {
 	s := new(fakeDiscoveryServer)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handler)
-	go http.Serve(list, mux)
+	go func() { _ = http.Serve(list, mux) }()
 
 	// This should succeed
 	addresses, err := testLookup("http://" + list.Addr().String() + "?insecure&noannounce")
@@ -110,9 +110,8 @@ func TestGlobalOverHTTPS(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Generate a server certificate, using fewer bits than usual to hurry the
-	// process along a bit.
-	cert, err := tlsutil.NewCertificate(dir+"/cert.pem", dir+"/key.pem", "syncthing", 1024)
+	// Generate a server certificate.
+	cert, err := tlsutil.NewCertificate(dir+"/cert.pem", dir+"/key.pem", "syncthing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +125,7 @@ func TestGlobalOverHTTPS(t *testing.T) {
 	s := new(fakeDiscoveryServer)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handler)
-	go http.Serve(list, mux)
+	go func() { _ = http.Serve(list, mux) }()
 
 	// With default options the lookup code expects the server certificate to
 	// check out according to the usual CA chains etc. That won't be the case
@@ -176,9 +175,8 @@ func TestGlobalAnnounce(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Generate a server certificate, using fewer bits than usual to hurry the
-	// process along a bit.
-	cert, err := tlsutil.NewCertificate(dir+"/cert.pem", dir+"/key.pem", "syncthing", 1024)
+	// Generate a server certificate.
+	cert, err := tlsutil.NewCertificate(dir+"/cert.pem", dir+"/key.pem", "syncthing")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +190,7 @@ func TestGlobalAnnounce(t *testing.T) {
 	s := new(fakeDiscoveryServer)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handler)
-	go http.Serve(list, mux)
+	go func() { _ = http.Serve(list, mux) }()
 
 	url := "https://" + list.Addr().String() + "?insecure"
 	disco, err := NewGlobal(url, cert, new(fakeAddressLister))

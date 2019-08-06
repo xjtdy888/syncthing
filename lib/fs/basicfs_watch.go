@@ -11,9 +11,6 @@ package fs
 import (
 	"context"
 	"errors"
-	"fmt"
-	"path/filepath"
-	"strings"
 
 	"github.com/syncthing/notify"
 )
@@ -23,10 +20,10 @@ import (
 // Not meant to be changed, but must be changeable for tests
 var backendBuffer = 500
 
-func (f *BasicFilesystem) Watch(name string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, error) {
-	absName, err := f.rootedSymlinkEvaluated(name)
+func (f *BasicFilesystem) Watch(name string, ignore Matcher, ctx context.Context, ignorePerms bool) (<-chan Event, <-chan error, error) {
+	watchPath, root, err := f.watchPaths(name)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 
 	outChan := make(chan Event)
@@ -39,26 +36,31 @@ func (f *BasicFilesystem) Watch(name string, ignore Matcher, ctx context.Context
 
 	if ignore.SkipIgnoredDirs() {
 		absShouldIgnore := func(absPath string) bool {
-			return ignore.ShouldIgnore(f.unrootedChecked(absPath))
+			rel, err := f.unrootedChecked(absPath, root)
+			if err != nil {
+				return true
+			}
+			return ignore.ShouldIgnore(rel)
 		}
-		err = notify.WatchWithFilter(filepath.Join(absName, "..."), backendChan, absShouldIgnore, eventMask)
+		err = notify.WatchWithFilter(watchPath, backendChan, absShouldIgnore, eventMask)
 	} else {
-		err = notify.Watch(filepath.Join(absName, "..."), backendChan, eventMask)
+		err = notify.Watch(watchPath, backendChan, eventMask)
 	}
 	if err != nil {
 		notify.Stop(backendChan)
 		if reachedMaxUserWatches(err) {
 			err = errors.New("failed to setup inotify handler. Please increase inotify limits, see https://docs.syncthing.net/users/faq.html#inotify-limits")
 		}
-		return nil, err
+		return nil, nil, err
 	}
 
-	go f.watchLoop(name, backendChan, outChan, ignore, ctx)
+	errChan := make(chan error)
+	go f.watchLoop(name, root, backendChan, outChan, errChan, ignore, ctx)
 
-	return outChan, nil
+	return outChan, errChan, nil
 }
 
-func (f *BasicFilesystem) watchLoop(name string, backendChan chan notify.EventInfo, outChan chan<- Event, ignore Matcher, ctx context.Context) {
+func (f *BasicFilesystem) watchLoop(name, evalRoot string, backendChan chan notify.EventInfo, outChan chan<- Event, errChan chan<- error, ignore Matcher, ctx context.Context) {
 	for {
 		// Detect channel overflow
 		if len(backendChan) == backendBuffer {
@@ -77,7 +79,18 @@ func (f *BasicFilesystem) watchLoop(name string, backendChan chan notify.EventIn
 
 		select {
 		case ev := <-backendChan:
-			relPath := f.unrootedChecked(ev.Path())
+			relPath, err := f.unrootedChecked(ev.Path(), evalRoot)
+			if err != nil {
+				select {
+				case errChan <- err:
+					l.Debugln(f.Type(), f.URI(), "Watch: Sending error", err)
+				case <-ctx.Done():
+				}
+				notify.Stop(backendChan)
+				l.Debugln(f.Type(), f.URI(), "Watch: Stopped due to", err)
+				return
+			}
+
 			if ignore.ShouldIgnore(relPath) {
 				l.Debugln(f.Type(), f.URI(), "Watch: Ignoring", relPath)
 				continue
@@ -104,18 +117,4 @@ func (f *BasicFilesystem) eventType(notifyType notify.Event) EventType {
 		return Remove
 	}
 	return NonRemove
-}
-
-// unrootedChecked returns the path relative to the folder root (same as
-// unrooted). It panics if the given path is not a subpath and handles the
-// special case when the given path is the folder root without a trailing
-// pathseparator.
-func (f *BasicFilesystem) unrootedChecked(absPath string) string {
-	if absPath+string(PathSeparator) == f.rootSymlinkEvaluated {
-		return "."
-	}
-	if !strings.HasPrefix(absPath, f.rootSymlinkEvaluated) {
-		panic(fmt.Sprintf("bug: Notify backend is processing a change outside of the filesystem root: root==%v, rootSymEval==%v, path==%v", f.root, f.rootSymlinkEvaluated, absPath))
-	}
-	return f.unrootedSymlinkEvaluated(f.resolveWin83(absPath))
 }

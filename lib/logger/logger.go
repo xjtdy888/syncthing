@@ -6,6 +6,7 @@ package logger
 
 import (
 	"fmt"
+	"io"
 	"io/ioutil"
 	"log"
 	"os"
@@ -24,11 +25,13 @@ const (
 	LevelVerbose
 	LevelInfo
 	LevelWarn
-	LevelFatal
 	NumLevels
 )
 
-const DebugFlags = log.Ltime | log.Ldate | log.Lmicroseconds | log.Lshortfile
+const (
+	DefaultFlags = log.Ltime
+	DebugFlags   = log.Ltime | log.Ldate | log.Lmicroseconds | log.Lshortfile
+)
 
 // A MessageHandler is called with the log level and message text.
 type MessageHandler func(l LogLevel, msg string)
@@ -45,8 +48,6 @@ type Logger interface {
 	Infof(format string, vals ...interface{})
 	Warnln(vals ...interface{})
 	Warnf(format string, vals ...interface{})
-	Fatalln(vals ...interface{})
-	Fatalf(format string, vals ...interface{})
 	ShouldDebug(facility string) bool
 	SetDebug(facility string, enabled bool)
 	Facilities() map[string]string
@@ -57,8 +58,8 @@ type Logger interface {
 type logger struct {
 	logger     *log.Logger
 	handlers   [NumLevels][]MessageHandler
-	facilities map[string]string // facility name => description
-	debug      map[string]bool   // facility name => debugging enabled
+	facilities map[string]string   // facility name => description
+	debug      map[string]struct{} // only facility names with debugging enabled
 	mut        sync.Mutex
 }
 
@@ -67,14 +68,18 @@ var DefaultLogger = New()
 
 func New() Logger {
 	if os.Getenv("LOGGER_DISCARD") != "" {
-		// Hack to completely disable logging, for example when running benchmarks.
-		return &logger{
-			logger: log.New(ioutil.Discard, "", 0),
-		}
+		// Hack to completely disable logging, for example when running
+		// benchmarks.
+		return newLogger(ioutil.Discard)
 	}
+	return newLogger(controlStripper{os.Stdout})
+}
 
+func newLogger(w io.Writer) Logger {
 	return &logger{
-		logger: log.New(os.Stdout, "", log.Ltime),
+		logger:     log.New(w, "", DefaultFlags),
+		facilities: make(map[string]string),
+		debug:      make(map[string]struct{}),
 	}
 }
 
@@ -106,7 +111,7 @@ func (l *logger) callHandlers(level LogLevel, s string) {
 
 // Debugln logs a line with a DEBUG prefix.
 func (l *logger) Debugln(vals ...interface{}) {
-	l.debugln(3, vals)
+	l.debugln(3, vals...)
 }
 func (l *logger) debugln(level int, vals ...interface{}) {
 	s := fmt.Sprintln(vals...)
@@ -182,32 +187,10 @@ func (l *logger) Warnf(format string, vals ...interface{}) {
 	l.callHandlers(LevelWarn, s)
 }
 
-// Fatalln logs a line with a FATAL prefix and exits the process with exit
-// code 1.
-func (l *logger) Fatalln(vals ...interface{}) {
-	s := fmt.Sprintln(vals...)
-	l.mut.Lock()
-	defer l.mut.Unlock()
-	l.logger.Output(2, "FATAL: "+s)
-	l.callHandlers(LevelFatal, s)
-	os.Exit(1)
-}
-
-// Fatalf logs a formatted line with a FATAL prefix and exits the process with
-// exit code 1.
-func (l *logger) Fatalf(format string, vals ...interface{}) {
-	s := fmt.Sprintf(format, vals...)
-	l.mut.Lock()
-	defer l.mut.Unlock()
-	l.logger.Output(2, "FATAL: "+s)
-	l.callHandlers(LevelFatal, s)
-	os.Exit(1)
-}
-
 // ShouldDebug returns true if the given facility has debugging enabled.
 func (l *logger) ShouldDebug(facility string) bool {
 	l.mut.Lock()
-	res := l.debug[facility]
+	_, res := l.debug[facility]
 	l.mut.Unlock()
 	return res
 }
@@ -215,20 +198,25 @@ func (l *logger) ShouldDebug(facility string) bool {
 // SetDebug enabled or disables debugging for the given facility name.
 func (l *logger) SetDebug(facility string, enabled bool) {
 	l.mut.Lock()
-	l.debug[facility] = enabled
-	l.mut.Unlock()
-	l.SetFlags(DebugFlags)
+	defer l.mut.Unlock()
+	if _, ok := l.debug[facility]; enabled && !ok {
+		l.SetFlags(DebugFlags)
+		l.debug[facility] = struct{}{}
+	} else if !enabled && ok {
+		delete(l.debug, facility)
+		if len(l.debug) == 0 {
+			l.SetFlags(DefaultFlags)
+		}
+	}
 }
 
 // FacilityDebugging returns the set of facilities that have debugging
 // enabled.
 func (l *logger) FacilityDebugging() []string {
-	var enabled []string
+	enabled := make([]string, 0, len(l.debug))
 	l.mut.Lock()
-	for facility, isEnabled := range l.debug {
-		if isEnabled {
-			enabled = append(enabled, facility)
-		}
+	for facility := range l.debug {
+		enabled = append(enabled, facility)
 	}
 	l.mut.Unlock()
 	return enabled
@@ -249,17 +237,7 @@ func (l *logger) Facilities() map[string]string {
 // NewFacility returns a new logger bound to the named facility.
 func (l *logger) NewFacility(facility, description string) Logger {
 	l.mut.Lock()
-	if l.facilities == nil {
-		l.facilities = make(map[string]string)
-	}
-	if description != "" {
-		l.facilities[facility] = description
-	}
-
-	if l.debug == nil {
-		l.debug = make(map[string]bool)
-	}
-	l.debug[facility] = false
+	l.facilities[facility] = description
 	l.mut.Unlock()
 
 	return &facilityLogger{
@@ -371,4 +349,24 @@ func (r *recorder) append(l LogLevel, msg string) {
 	if len(r.lines) == r.initial {
 		r.lines = append(r.lines, Line{time.Now(), "...", l})
 	}
+}
+
+// controlStripper is a Writer that replaces control characters
+// with spaces.
+type controlStripper struct {
+	io.Writer
+}
+
+func (s controlStripper) Write(data []byte) (int, error) {
+	for i, b := range data {
+		if b == '\n' || b == '\r' {
+			// Newlines are OK
+			continue
+		}
+		if b < 32 {
+			// Characters below 32 are control characters
+			data[i] = ' '
+		}
+	}
+	return s.Writer.Write(data)
 }
